@@ -1,0 +1,25 @@
+name: no-claude-attribution
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          bad='\bclaude\b|claude\[bot\]|@anthropic\.com'
+          if git log --format='%an <%ae>%n%cn <%ce>%n%(trailers:key=Co-authored-by,valueonly)' "$BASE..$HEAD" | grep -Ei "$bad"; then
+            echo "::error::Claude found as a commit author, committer or co-author"
+            exit 1
+          fi
+          if printf '%s' "$PR_BODY" | grep -Ei "co-authored-by:.*($bad)"; then
+            echo "::error::Claude co-author found in the PR body"
+            exit 1
+          fi
