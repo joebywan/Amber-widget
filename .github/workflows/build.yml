@@ -5,7 +5,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: the binary needs the glibc it was built against or newer, and 24.04 matches Mint 22.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
