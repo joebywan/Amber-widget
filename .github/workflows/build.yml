@@ -5,7 +5,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned to an older release rather than ubuntu-latest: the binary runs only where glibc is at least the one it was built against (2.35 here).
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
