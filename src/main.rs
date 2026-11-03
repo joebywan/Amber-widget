@@ -15,10 +15,14 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Timelike, Utc};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Shape, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 const BRACKET_SECONDS: i64 = 300;
-const FAST_POLL_SECONDS: i64 = 3;
-const SLOW_POLL_SECONDS: i64 = 10;
+// Amber allows about 50 calls per 5 minutes per account. The worst case below (a price that never
+// appears, nothing learned yet) is 30 fast checks plus 18 slow ones.
+const FAST_POLL_MS: i64 = 1000;
+const SLOW_POLL_MS: i64 = 15_000;
 const MIN_DELAY_SAMPLES: usize = 5;
+const RECENT_DELAY_SAMPLES: usize = 6;
 const MAX_DELAY_SAMPLES: usize = 100;
 const ERROR_RETRY_SECONDS: i64 = 60;
 const USAGE_PERIOD: Duration = Duration::from_secs(3600);
@@ -237,25 +241,37 @@ fn next_bracket(now: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp(seconds - seconds.rem_euclid(BRACKET_SECONDS) + BRACKET_SECONDS, 0).unwrap_or(now)
 }
 
-/// Seconds after a bracket starts to make the first check, just ahead of Amber's usual publishing time.
-fn first_poll_seconds(delays: &[f64]) -> i64 {
+/// The delays that steer the checks: the last half hour, so a change in Amber's timing shows up quickly.
+fn recent_delays(delays: &[f64]) -> &[f64] {
+    &delays[delays.len().saturating_sub(RECENT_DELAY_SAMPLES)..]
+}
+
+/// Milliseconds after a bracket starts to make the first check, just ahead of Amber's usual publishing time.
+fn first_poll_ms(delays: &[f64]) -> i64 {
     if delays.len() < MIN_DELAY_SAMPLES {
         return 0;
     }
-    (percentile(delays, 0.25) as i64 - FAST_POLL_SECONDS).max(0)
+    ((percentile(recent_delays(delays), 0.25) * 1000.0) as i64 - FAST_POLL_MS).max(0)
+}
+
+/// When the price counts as unusually late, in milliseconds into the bracket.
+fn fast_until_ms(delays: &[f64]) -> i64 {
+    if delays.len() < MIN_DELAY_SAMPLES {
+        return 30_000;
+    }
+    (percentile(recent_delays(delays), 0.9) * 1000.0) as i64 + 5000
 }
 
 /// Gap until the next check: fast while the price is due, slower once it's unusually late.
-fn poll_gap_seconds(delays: &[f64], seconds_into_bracket: i64) -> i64 {
-    let due_until = if delays.len() < MIN_DELAY_SAMPLES { 60 } else { percentile(delays, 0.9) as i64 + 15 };
-    if seconds_into_bracket < due_until { FAST_POLL_SECONDS } else { SLOW_POLL_SECONDS }
+fn poll_gap_ms(delays: &[f64], ms_into_bracket: i64) -> i64 {
+    if ms_into_bracket < fast_until_ms(delays) { FAST_POLL_MS } else { SLOW_POLL_MS }
 }
 
-/// Delay to learn from a check that found a new bracket. If the very first check found it, the real
-/// delay could be anything earlier, so aim a little lower to keep exploring instead of sticking there.
-fn delay_sample(seconds_into_bracket: f64, first_check: bool) -> f64 {
-    let explore = if first_check { FAST_POLL_SECONDS as f64 } else { 0.0 };
-    (seconds_into_bracket - explore).max(0.0)
+/// Delay to learn from a check that found a new bracket. Amber published between the last miss and this
+/// check, so take the midpoint. If the very first check found it, the real delay could be anything
+/// earlier, so aim well below it: a real move earlier is then found in a few brackets, not hours.
+fn delay_sample(found: f64, last_miss: Option<f64>) -> f64 {
+    last_miss.map_or(found / 2.0, |miss| (found + miss) / 2.0).max(0.0)
 }
 
 fn add_delay(delays: &mut Vec<f64>, sample: f64) {
@@ -265,15 +281,46 @@ fn add_delay(delays: &mut Vec<f64>, sample: f64) {
     }
 }
 
-/// Returns (should alert, is above). Alerts once per crossing, and re-arms when the price drops back.
+/// Returns (should alert, is above). Settings once per crossing, and re-arms when the price drops back.
 fn crossed(value: Option<f64>, limit: Option<f64>, was_above: bool) -> (bool, bool) {
     let above = matches!((value, limit), (Some(v), Some(l)) if v > l);
     (above && !was_above, above)
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+enum Sound {
+    Message,
+    Bell,
+    Alarm,
+    Warning,
+}
+
+impl Sound {
+    const ALL: [Sound; 4] = [Sound::Message, Sound::Bell, Sound::Alarm, Sound::Warning];
+
+    fn label(self) -> &'static str {
+        match self {
+            Sound::Message => "Message sound",
+            Sound::Bell => "Bell sound",
+            Sound::Alarm => "Alarm sound",
+            Sound::Warning => "Warning sound",
+        }
+    }
+
+    /// Name in the freedesktop sound theme.
+    fn theme_name(self) -> &'static str {
+        match self {
+            Sound::Message => "message-new-instant",
+            Sound::Bell => "bell",
+            Sound::Alarm => "alarm-clock-elapsed",
+            Sound::Warning => "dialog-warning",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(default)]
-struct Alerts {
+struct Settings {
     buy_on: bool,
     buy: f64,
     sell_on: bool,
@@ -282,9 +329,12 @@ struct Alerts {
     buy_below: f64,
     sell_forecast_on: bool,
     sell_forecast: f64,
+    sound_on: bool,
+    sound: Sound,
+    tray: tray::Show,
 }
 
-impl Default for Alerts {
+impl Default for Settings {
     fn default() -> Self {
         Self {
             buy_on: false,
@@ -295,11 +345,14 @@ impl Default for Alerts {
             buy_below: 10.0,
             sell_forecast_on: false,
             sell_forecast: 30.0,
+            sound_on: true,
+            sound: Sound::Message,
+            tray: tray::Show::Buy,
         }
     }
 }
 
-impl Alerts {
+impl Settings {
     fn buy_limit(&self) -> Option<f64> {
         self.buy_on.then_some(self.buy)
     }
@@ -412,26 +465,42 @@ fn build_prices(now: &[Interval], chart: &[Interval]) -> Result<Prices, String> 
     })
 }
 
+fn tray_status(prices: &Prices, show: tray::Show) -> tray::Status {
+    let spike = prices.spike.as_ref().is_some_and(|(start, _)| *start <= Utc::now());
+    tray::Status { buy: prices.buy, sell: prices.sell, spike, show }
+}
+
+fn send_alert(message: &str, settings: &Settings) -> Result<(), String> {
+    let mut notification = notify_rust::Notification::new();
+    notification.summary("Amber").body(message);
+    if settings.sound_on {
+        // ponytail: the notification daemon plays it, so a daemon without sound support stays silent.
+        notification.sound_name(settings.sound.theme_name());
+    }
+    notification.show().map(|_| ()).map_err(|e| e.to_string())
+}
+
 // --- Token storage and HTTP ---
 
 fn token_path() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("amber-widget").join("token")
 }
 
-fn alerts_path() -> PathBuf {
+// Keeps its old name so existing alert settings survive.
+fn settings_path() -> PathBuf {
     token_path().with_file_name("alerts.json")
 }
 
-fn read_alerts() -> Alerts {
-    fs::read_to_string(alerts_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+fn read_settings() -> Settings {
+    fs::read_to_string(settings_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
-fn save_alerts(alerts: &Alerts) -> std::io::Result<()> {
-    let path = alerts_path();
+fn save_settings(settings: &Settings) -> std::io::Result<()> {
+    let path = settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string(alerts)?)
+    fs::write(path, serde_json::to_string(settings)?)
 }
 
 fn delays_path() -> PathBuf {
@@ -487,14 +556,33 @@ enum Update {
     Done(Option<String>),
     NeedToken(&'static str),
     Waiting,
-    TypicalDelay(f64),
+    Timing(Timing),
+}
+
+/// What the Settings tab shows about when the worker checks for a new price. All in seconds into a bracket.
+struct Timing {
+    recent: Vec<f64>,
+    stored: usize,
+    first_check: f64,
+    fast_until: f64,
+    checks: u32,
+}
+
+fn timing(delays: &[f64], checks: u32) -> Timing {
+    Timing {
+        recent: recent_delays(delays).iter().rev().copied().collect(),
+        stored: delays.len(),
+        first_check: first_poll_ms(delays) as f64 / 1000.0,
+        fast_until: fast_until_ms(delays) as f64 / 1000.0,
+        checks,
+    }
 }
 
 struct Worker {
     site: Option<String>,
     usage_at: Option<Instant>,
     alerted: HashSet<DateTime<Utc>>,
-    alerts: Arc<Mutex<Alerts>>,
+    settings: Arc<Mutex<Settings>>,
     buy_above: bool,
     sell_above: bool,
     buy_below: bool,
@@ -504,7 +592,7 @@ struct Worker {
     shown_end: Option<DateTime<Utc>>,
     delays: Vec<f64>,
     checks_this_bracket: u32,
-    // False after a refresh, error or sleep: those timings say nothing about Amber's delay.
+    last_miss: Option<DateTime<Utc>>,
     on_schedule: bool,
     send: Box<dyn Fn(Update) + Send>,
 }
@@ -525,16 +613,19 @@ impl Worker {
             }
         };
         let path = format!("/sites/{site}/prices/current");
+        // Sent time, not arrival: that's the moment the next first check gets aimed at.
+        let sent = Utc::now();
         let now: Vec<Interval> = get(&path, &[])?;
         let end = now.iter().find(|i| i.channel_type == "general").map(|i| i.end_time);
         let end = end.ok_or(FetchError::Other("Amber sent no general price".into()))?;
         let latest = end > Utc::now();
         if !forced && self.shown_end == Some(end) {
             self.checks_this_bracket += 1;
+            self.last_miss = Some(sent);
             return Ok(latest);
         }
         let duration = now.iter().find(|i| i.channel_type == "general").map_or(0, |i| i.duration);
-        self.learn_delay(end - TimeDelta::minutes(duration));
+        self.learn_delay(end - TimeDelta::minutes(duration), sent);
         let chart: Vec<Interval> = get(
             &path,
             &[("next", "48".into()), ("previous", "12".into()), ("resolution", "30".into())],
@@ -543,14 +634,15 @@ impl Worker {
         if let Some((start, message)) = &prices.spike
             && self.alerted.insert(*start)
         {
-            let _ = notify_rust::Notification::new().summary("Amber").body(message).show();
+            let settings = *self.settings.lock().unwrap();
+            let _ = send_alert(message, &settings);
         }
         self.check_alerts(&prices);
-        let spike = prices.spike.as_ref().is_some_and(|(start, _)| *start <= Utc::now());
-        let _ = self.tray.send(tray::Status { buy: prices.buy, sell: prices.sell, spike });
+        let _ = self.tray.send(tray_status(&prices, self.settings.lock().unwrap().tray));
         (self.send)(Update::Prices(Box::new(prices)));
         self.shown_end = Some(end);
         self.checks_this_bracket = 0;
+        self.last_miss = None;
 
         if self.usage_at.is_none_or(|at| at.elapsed() >= USAGE_PERIOD) {
             self.refresh_usage(&site)?;
@@ -581,49 +673,48 @@ impl Worker {
         Ok(())
     }
 
-    fn learn_delay(&mut self, bracket_start: DateTime<Utc>) {
+    fn learn_delay(&mut self, bracket_start: DateTime<Utc>, sent: DateTime<Utc>) {
         if self.on_schedule && self.shown_end == Some(bracket_start) {
-            let seconds = (Utc::now() - bracket_start).num_milliseconds() as f64 / 1000.0;
-            add_delay(&mut self.delays, delay_sample(seconds, self.checks_this_bracket == 0));
+            let seconds = |at: DateTime<Utc>| (at - bracket_start).num_milliseconds() as f64 / 1000.0;
+            add_delay(&mut self.delays, delay_sample(seconds(sent), self.last_miss.map(seconds)));
             // Only a scheduling hint, so losing it to a failed write just means relearning.
             if let Ok(text) = serde_json::to_string(&self.delays) {
                 let _ = fs::write(delays_path(), text);
             }
         }
-        if self.delays.len() >= MIN_DELAY_SAMPLES {
-            (self.send)(Update::TypicalDelay(percentile(&self.delays, 0.5)));
-        }
+        (self.send)(Update::Timing(timing(&self.delays, self.checks_this_bracket)));
     }
 
     fn check_alerts(&mut self, prices: &Prices) {
-        let alerts = *self.alerts.lock().unwrap();
-        let (fire_buy, buy_above) = crossed(Some(prices.buy), alerts.buy_limit(), self.buy_above);
-        let (fire_sell, sell_above) = crossed(prices.sell, alerts.sell_limit(), self.sell_above);
+        let settings = *self.settings.lock().unwrap();
+        let (fire_buy, buy_above) = crossed(Some(prices.buy), settings.buy_limit(), self.buy_above);
+        let (fire_sell, sell_above) = crossed(prices.sell, settings.sell_limit(), self.sell_above);
         (self.buy_above, self.sell_above) = (buy_above, sell_above);
         // Below is above with both sides negated.
-        let (fire_below, buy_below) = crossed(Some(-prices.buy), alerts.buy_below_limit().map(|l| -l), self.buy_below);
+        let (fire_below, buy_below) = crossed(Some(-prices.buy), settings.buy_below_limit().map(|l| -l), self.buy_below);
         let best = prices.best_sell;
-        let (fire_forecast, forecast_above) = crossed(best.map(|b| b.1), alerts.sell_forecast_limit(), self.sell_forecast_above);
+        let (fire_forecast, forecast_above) = crossed(best.map(|b| b.1), settings.sell_forecast_limit(), self.sell_forecast_above);
         (self.buy_below, self.sell_forecast_above) = (buy_below, forecast_above);
         let notify = |message: String| {
-            let _ = notify_rust::Notification::new().summary("Amber").body(&message).show();
+            let _ = send_alert(&message, &settings);
         };
         if fire_buy {
-            notify(format!("Buy price is {:.1}c, above your {:.1}c alert", prices.buy, alerts.buy));
+            notify(format!("Buy price is {:.1}c, above your {:.1}c alert", prices.buy, settings.buy));
         }
         if fire_sell {
-            notify(format!("Sell price is {:.1}c, above your {:.1}c alert", prices.sell.unwrap_or_default(), alerts.sell));
+            notify(format!("Sell price is {:.1}c, above your {:.1}c alert", prices.sell.unwrap_or_default(), settings.sell));
         }
         if fire_below {
-            notify(format!("Buy price is {:.1}c, below your {:.1}c alert", prices.buy, alerts.buy_below));
+            notify(format!("Buy price is {:.1}c, below your {:.1}c alert", prices.buy, settings.buy_below));
         }
         if let (true, Some((start, value))) = (fire_forecast, best) {
             let at = clock(start.with_timezone(&Local));
-            notify(format!("Sell forecast to reach {value:.1}c at {at}, above your {:.1}c alert", alerts.sell_forecast));
+            notify(format!("Sell forecast to reach {value:.1}c at {at}, above your {:.1}c alert", settings.sell_forecast));
         }
     }
 
     fn run(mut self, wake: Receiver<()>) {
+        (self.send)(Update::Timing(timing(&self.delays, 0)));
         let mut forced = true;
         let mut deadline = Utc::now();
         let mut failed = false;
@@ -632,7 +723,7 @@ impl Worker {
             // More than a few seconds late means the PC slept, so this check can't time Amber.
             self.on_schedule = !forced && !failed && now - deadline < TimeDelta::seconds(5);
             failed = false;
-            let next_first_check = |delays: &[f64]| next_bracket(Utc::now()) + TimeDelta::seconds(first_poll_seconds(delays));
+            let next_first_check = |delays: &[f64]| next_bracket(Utc::now()) + TimeDelta::milliseconds(first_poll_ms(delays));
             deadline = if read_token().is_empty() {
                 (self.send)(Update::NeedToken(""));
                 next_first_check(&self.delays)
@@ -644,8 +735,8 @@ impl Worker {
                     }
                     Ok(false) => {
                         (self.send)(Update::Waiting);
-                        let into_bracket = now.timestamp().rem_euclid(BRACKET_SECONDS);
-                        now + TimeDelta::seconds(poll_gap_seconds(&self.delays, into_bracket))
+                        let into_bracket = now.timestamp_millis().rem_euclid(BRACKET_SECONDS * 1000);
+                        now + TimeDelta::milliseconds(poll_gap_ms(&self.delays, into_bracket))
                     }
                     Err(FetchError::Unauthorized) => {
                         self.site = None;
@@ -690,6 +781,12 @@ fn wait_until(wake: &Receiver<()>, deadline: DateTime<Utc>) -> Option<bool> {
 
 // --- Window ---
 
+#[derive(PartialEq)]
+enum Tab {
+    Settings,
+    History,
+}
+
 struct App {
     updates: Receiver<Update>,
     wake: Sender<()>,
@@ -699,8 +796,10 @@ struct App {
     status: String,
     token_prompt: Option<&'static str>,
     token_input: String,
-    alerts: Arc<Mutex<Alerts>>,
-    typical_delay: Option<f64>,
+    settings: Arc<Mutex<Settings>>,
+    timing: Option<Timing>,
+    tab: Tab,
+    tray_updates: Sender<tray::Status>,
     tray: tray::Pump,
 }
 
@@ -708,23 +807,24 @@ impl App {
     fn new(ctx: egui::Context) -> Self {
         let (update_tx, updates) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel();
-        let alerts = Arc::new(Mutex::new(read_alerts()));
+        let settings = Arc::new(Mutex::new(read_settings()));
         let (tray_tx, tray_rx) = mpsc::channel();
         let pump = tray::start(ctx.clone(), tray_rx);
         let worker = Worker {
             site: None,
             usage_at: None,
             alerted: HashSet::new(),
-            alerts: alerts.clone(),
+            settings: settings.clone(),
             buy_above: false,
             sell_above: false,
             buy_below: false,
             sell_forecast_above: false,
-            tray: tray_tx,
+            tray: tray_tx.clone(),
             usage_days: BTreeMap::new(),
             shown_end: None,
             delays: read_delays(),
             checks_this_bracket: 0,
+            last_miss: None,
             on_schedule: false,
             send: Box::new(move |update| {
                 let _ = update_tx.send(update);
@@ -741,8 +841,10 @@ impl App {
             status: "Loading…".into(),
             token_prompt: None,
             token_input: String::new(),
-            alerts,
-            typical_delay: None,
+            settings,
+            timing: None,
+            tab: Tab::Settings,
+            tray_updates: tray_tx,
             tray: pump,
         }
     }
@@ -754,7 +856,7 @@ impl App {
                 self.updated_at = Some(Local::now());
             }
             Update::Usage(days) => self.usage = Some(days),
-            Update::TypicalDelay(seconds) => self.typical_delay = Some(seconds),
+            Update::Timing(timing) => self.timing = Some(timing),
             Update::Waiting => self.status = "Waiting for Amber's latest 5-minute price…".into(),
             Update::NeedToken(problem) => {
                 self.token_prompt = Some(problem);
@@ -793,6 +895,160 @@ impl App {
         }
         ui.separator();
     }
+
+    fn now_section(&mut self, ui: &mut egui::Ui) {
+        if let Some(problem) = self.token_prompt {
+            self.token_form(ui, problem);
+        }
+        let prices = self.prices.as_ref();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 28.0;
+            let dash = || "–".to_string();
+            tile(ui, "Buy from grid", prices.map_or_else(dash, |p| format!("{:.1}c", p.buy)), prices.map_or("", |p| &p.buy_note));
+            let sell = prices.and_then(|p| p.sell);
+            let note = match (prices, sell) {
+                (None, _) => "",
+                (Some(_), None) => "no feed-in channel",
+                (_, Some(s)) if s < 0.0 => "you pay to export",
+                _ => "you earn",
+            };
+            tile(ui, "Sell to grid", sell.map_or_else(dash, |s| format!("{s:.1}c")), note);
+            tile(ui, "Grid renewables", prices.map_or_else(dash, |p| format!("{:.0}%", p.renewables)), if prices.is_some() { "right now" } else { "" });
+        });
+        ui.add_space(6.0);
+        if let Some(p) = prices {
+            ui.label(RichText::new(p.advice).strong());
+            if let Some((_, message)) = &p.spike {
+                ui.label(RichText::new(message).strong());
+            }
+            if !p.tariff.is_empty() {
+                ui.label(&p.tariff);
+            }
+            if !p.export.is_empty() {
+                ui.label(&p.export);
+            }
+            ui.weak(&p.windows);
+            draw_chart(ui, &p.chart_buy, &p.chart_sell);
+            ui.weak("Solid: actual. Dashed: forecast, with its likely range shaded. Grey: peak. Top strip: export charge or bonus.");
+        }
+    }
+
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Alerts").strong());
+        let saved = *self.settings.lock().unwrap();
+        let mut edited = saved;
+        egui::Grid::new("alerts").spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+            alert_row(ui, "Buy goes above", &mut edited.buy_on, &mut edited.buy);
+            alert_row(ui, "Buy falls below", &mut edited.buy_below_on, &mut edited.buy_below);
+            alert_row(ui, "Sell goes above", &mut edited.sell_on, &mut edited.sell);
+            alert_row(ui, "Sell forecast above", &mut edited.sell_forecast_on, &mut edited.sell_forecast);
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut edited.sound_on, "Play");
+            ui.add_enabled_ui(edited.sound_on, |ui| {
+                egui::ComboBox::from_id_salt("sound").selected_text(edited.sound.label()).show_ui(ui, |ui| {
+                    for sound in Sound::ALL {
+                        ui.selectable_value(&mut edited.sound, sound, sound.label());
+                    }
+                });
+            });
+            if ui.button("Send test alert").clicked() {
+                self.status = match send_alert("This is a test alert.", &edited) {
+                    Ok(()) => "Test alert sent.".into(),
+                    Err(e) => format!("Couldn't send the test alert: {e}"),
+                };
+            }
+        });
+        if let Some(p) = &self.prices {
+            if edited.buy_limit().is_some_and(|limit| p.buy > limit) {
+                ui.label(RichText::new(format!("Buy {:.1}c is above your {:.1}c alert", p.buy, edited.buy)).strong());
+            }
+            if edited.buy_below_limit().is_some_and(|limit| p.buy < limit) {
+                ui.label(RichText::new(format!("Buy {:.1}c is below your {:.1}c alert", p.buy, edited.buy_below)).strong());
+            }
+            if let (Some((start, value)), Some(limit)) = (p.best_sell, edited.sell_forecast_limit())
+                && value > limit
+            {
+                let at = clock(start.with_timezone(&Local));
+                ui.label(RichText::new(format!("Sell forecast {value:.1}c at {at} is above your {limit:.1}c alert")).strong());
+            }
+            if let (Some(sell), Some(limit)) = (p.sell, edited.sell_limit())
+                && sell > limit
+            {
+                ui.label(RichText::new(format!("Sell {sell:.1}c is above your {limit:.1}c alert")).strong());
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Tray icon shows").strong());
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut edited.tray, tray::Show::Buy, "Buy price");
+            ui.radio_value(&mut edited.tray, tray::Show::Sell, "Sell price");
+            ui.radio_value(&mut edited.tray, tray::Show::Logo, "Logo only");
+        });
+        if edited != saved {
+            *self.settings.lock().unwrap() = edited;
+            if let Err(e) = save_settings(&edited) {
+                self.status = format!("Couldn't save settings: {e}");
+            }
+            if let Some(p) = &self.prices {
+                let _ = self.tray_updates.send(tray_status(p, edited.tray));
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Price check timing").strong());
+        match &self.timing {
+            Some(timing) => timing_view(ui, timing),
+            None => {
+                ui.weak("Nothing measured yet");
+            }
+        }
+    }
+
+    fn history_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Grid meter").strong());
+        match &self.usage {
+            Some(days) if !days.is_empty() => {
+                let label = |month: &str| {
+                    NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
+                        .map_or(month.to_string(), |d| d.format("%B %Y").to_string())
+                };
+                let months = month_totals(days).into_iter().take(2).map(|(m, d)| (label(&m), d)).collect();
+                usage_grid(ui, "months", months);
+                ui.add_space(4.0);
+                let recent = days.iter().rev().take(7).map(|(day, totals)| {
+                    let name = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                        .map_or(day.clone(), |d| d.format("%a %-d %b").to_string());
+                    (name, *totals)
+                });
+                usage_grid(ui, "days", recent.collect());
+            }
+            _ => {
+                ui.weak("No meter data yet");
+            }
+        }
+        ui.weak("Energy charges only, so bills will also include daily supply and Amber's fee. Amber doesn't report solar generation or battery level.");
+    }
+}
+
+fn timing_view(ui: &mut egui::Ui, timing: &Timing) {
+    egui::Grid::new("timing").spacing(vec2(12.0, 2.0)).show(ui, |ui| {
+        let mut row = |name: &str, value: String| {
+            ui.weak(name);
+            ui.label(value);
+            ui.end_row();
+        };
+        if timing.stored >= MIN_DELAY_SAMPLES {
+            row("Amber usually publishes", format!("{:.3}s into each bracket", percentile(&timing.recent, 0.5)));
+        } else {
+            row("Still learning", format!("{} of {MIN_DELAY_SAMPLES} brackets measured", timing.stored));
+        }
+        row("First check", format!("{:.3}s into each bracket", timing.first_check));
+        row("Then checks", format!("every {:.1}s until {:.3}s, then every {:.0}s", FAST_POLL_MS as f64 / 1000.0, timing.fast_until, SLOW_POLL_MS as f64 / 1000.0));
+        row("Missed checks last bracket", timing.checks.to_string());
+        let recent: Vec<String> = timing.recent.iter().map(|s| format!("{s:.3}s")).collect();
+        row("Recent delays, newest first", recent.join(", "));
+        row("Delays stored", format!("{} of {MAX_DELAY_SAMPLES}, only the last {RECENT_DELAY_SAMPLES} steer the checks", timing.stored));
+    });
 }
 
 fn alert_row(ui: &mut egui::Ui, name: &str, on: &mut bool, limit: &mut f64) {
@@ -944,110 +1200,29 @@ impl eframe::App for App {
         // Keeps the chart's "now" marker moving.
         ui.ctx().request_repaint_after(Duration::from_secs(60));
 
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Refresh").clicked() {
+                    let _ = self.wake.send(());
+                }
+                ui.weak(&self.status);
+            });
+        });
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(problem) = self.token_prompt {
-                    self.token_form(ui, problem);
-                }
-                let prices = self.prices.as_ref();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 28.0;
-                    let dash = || "–".to_string();
-                    tile(ui, "Buy from grid", prices.map_or_else(dash, |p| format!("{:.1}c", p.buy)), prices.map_or("", |p| &p.buy_note));
-                    let sell = prices.and_then(|p| p.sell);
-                    let note = match (prices, sell) {
-                        (None, _) => "",
-                        (Some(_), None) => "no feed-in channel",
-                        (_, Some(s)) if s < 0.0 => "you pay to export",
-                        _ => "you earn",
-                    };
-                    tile(ui, "Sell to grid", sell.map_or_else(dash, |s| format!("{s:.1}c")), note);
-                    tile(ui, "Grid renewables", prices.map_or_else(dash, |p| format!("{:.0}%", p.renewables)), if prices.is_some() { "right now" } else { "" });
-                });
-                ui.add_space(6.0);
-                if let Some(p) = prices {
-                    ui.label(RichText::new(p.advice).strong());
-                    if let Some((_, message)) = &p.spike {
-                        ui.label(RichText::new(message).strong());
-                    }
-                    if !p.tariff.is_empty() {
-                        ui.label(&p.tariff);
-                    }
-                    if !p.export.is_empty() {
-                        ui.label(&p.export);
-                    }
-                    ui.weak(&p.windows);
-                    draw_chart(ui, &p.chart_buy, &p.chart_sell);
-                    ui.weak("Solid: actual. Dashed: forecast, with its likely range shaded. Grey: peak. Top strip: export charge or bonus.");
-                }
-                ui.add_space(6.0);
-                ui.label(RichText::new("Alerts").strong());
-                let saved = *self.alerts.lock().unwrap();
-                let mut edited = saved;
-                egui::Grid::new("alerts").spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-                    alert_row(ui, "Buy goes above", &mut edited.buy_on, &mut edited.buy);
-                    alert_row(ui, "Buy falls below", &mut edited.buy_below_on, &mut edited.buy_below);
-                    alert_row(ui, "Sell goes above", &mut edited.sell_on, &mut edited.sell);
-                    alert_row(ui, "Sell forecast above", &mut edited.sell_forecast_on, &mut edited.sell_forecast);
-                });
-                if edited != saved {
-                    *self.alerts.lock().unwrap() = edited;
-                    if let Err(e) = save_alerts(&edited) {
-                        self.status = format!("Couldn't save alerts: {e}");
-                    }
-                }
-                if let Some(p) = prices {
-                    if edited.buy_limit().is_some_and(|limit| p.buy > limit) {
-                        ui.label(RichText::new(format!("Buy {:.1}c is above your {:.1}c alert", p.buy, edited.buy)).strong());
-                    }
-                    if edited.buy_below_limit().is_some_and(|limit| p.buy < limit) {
-                        ui.label(RichText::new(format!("Buy {:.1}c is below your {:.1}c alert", p.buy, edited.buy_below)).strong());
-                    }
-                    if let (Some((start, value)), Some(limit)) = (p.best_sell, edited.sell_forecast_limit())
-                        && value > limit
-                    {
-                        let at = clock(start.with_timezone(&Local));
-                        ui.label(RichText::new(format!("Sell forecast {value:.1}c at {at} is above your {limit:.1}c alert")).strong());
-                    }
-                    if let (Some(sell), Some(limit)) = (p.sell, edited.sell_limit())
-                        && sell > limit
-                    {
-                        ui.label(RichText::new(format!("Sell {sell:.1}c is above your {limit:.1}c alert")).strong());
-                    }
-                }
-                ui.add_space(6.0);
-                ui.label(RichText::new("Grid meter").strong());
-                match &self.usage {
-                    Some(days) if !days.is_empty() => {
-                        let label = |month: &str| {
-                            NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
-                                .map_or(month.to_string(), |d| d.format("%B %Y").to_string())
-                        };
-                        let months = month_totals(days).into_iter().take(2).map(|(m, d)| (label(&m), d)).collect();
-                        usage_grid(ui, "months", months);
-                        ui.add_space(4.0);
-                        let recent = days.iter().rev().take(7).map(|(day, totals)| {
-                            let name = NaiveDate::parse_from_str(day, "%Y-%m-%d")
-                                .map_or(day.clone(), |d| d.format("%a %-d %b").to_string());
-                            (name, *totals)
-                        });
-                        usage_grid(ui, "days", recent.collect());
-                    }
-                    _ => {
-                        ui.weak("No meter data yet");
-                    }
-                }
-                ui.weak("Energy charges only, so bills will also include daily supply and Amber's fee. Amber doesn't report solar generation or battery level.");
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Refresh").clicked() {
-                        let _ = self.wake.send(());
-                    }
-                    ui.weak(&self.status);
-                    if let Some(seconds) = self.typical_delay {
-                        ui.weak(format!("· Amber usually publishes {seconds:.0}s into each bracket"));
-                    }
-                });
+            let half = ui.available_height() / 2.0;
+            egui::ScrollArea::vertical().id_salt("now").max_height(half).auto_shrink([false, false]).show(ui, |ui| {
+                self.now_section(ui);
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                ui.selectable_value(&mut self.tab, Tab::History, "History");
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().id_salt("tab").auto_shrink([false, false]).show(ui, |ui| match self.tab {
+                Tab::Settings => self.settings_tab(ui),
+                Tab::History => self.history_tab(ui),
             });
         });
     }
@@ -1074,10 +1249,14 @@ fn desktop_zoom() -> f32 {
 
 fn main() -> eframe::Result {
     let zoom = desktop_zoom();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Amber").with_inner_size([520.0 * zoom, 900.0 * zoom]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Amber")
+        .with_app_id("amber-widget")
+        .with_inner_size([520.0 * zoom, 900.0 * zoom]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Amber",
         options,
@@ -1158,37 +1337,75 @@ mod tests {
 
     #[test]
     fn alert_settings_survive_missing_fields() {
-        let alerts: Alerts = serde_json::from_str(r#"{"buy_on":true,"buy":42.5}"#).unwrap();
-        assert_eq!(alerts.buy_limit(), Some(42.5));
-        assert_eq!(alerts.sell_limit(), None);
+        let settings: Settings = serde_json::from_str(r#"{"buy_on":true,"buy":42.5}"#).unwrap();
+        assert_eq!(settings.buy_limit(), Some(42.5));
+        assert_eq!(settings.sell_limit(), None);
     }
 
     #[test]
     fn polling_follows_the_learned_delay() {
-        // Too little history: check from the boundary, fast for the first minute.
-        assert_eq!(first_poll_seconds(&[25.0; 4]), 0);
-        assert_eq!(poll_gap_seconds(&[25.0; 4], 59), FAST_POLL_SECONDS);
-        assert_eq!(poll_gap_seconds(&[25.0; 4], 60), SLOW_POLL_SECONDS);
-        // Learned 25s: sleep until just before it, slow down once well past it.
-        assert_eq!(first_poll_seconds(&[25.0; 5]), 22);
-        assert_eq!(poll_gap_seconds(&[25.0; 5], 39), FAST_POLL_SECONDS);
-        assert_eq!(poll_gap_seconds(&[25.0; 5], 40), SLOW_POLL_SECONDS);
+        // Too little history: check from the boundary, fast for the first 30 seconds.
+        assert_eq!(first_poll_ms(&[25.0; 4]), 0);
+        assert_eq!(poll_gap_ms(&[25.0; 4], 29_999), FAST_POLL_MS);
+        assert_eq!(poll_gap_ms(&[25.0; 4], 30_000), SLOW_POLL_MS);
+        // Learned 25.25s: sleep until just before it, slow down once well past it.
+        assert_eq!(first_poll_ms(&[25.25; 5]), 24_250);
+        assert_eq!(poll_gap_ms(&[25.25; 5], 30_249), FAST_POLL_MS);
+        assert_eq!(poll_gap_ms(&[25.25; 5], 30_250), SLOW_POLL_MS);
         // Never earlier than the boundary.
-        assert_eq!(first_poll_seconds(&[1.0; 5]), 0);
+        assert_eq!(first_poll_ms(&[0.5; 5]), 0);
     }
 
     #[test]
-    fn first_check_hits_drift_the_estimate_earlier() {
-        assert_eq!(delay_sample(25.0, false), 25.0);
-        assert_eq!(delay_sample(25.0, true), 22.0);
-        assert_eq!(delay_sample(1.0, true), 0.0);
-        let mut delays = vec![40.0; 8];
-        for _ in 0..100 {
-            let first = first_poll_seconds(&delays) as f64;
-            add_delay(&mut delays, delay_sample(first.max(10.0), first >= 10.0));
+    fn delay_samples_use_what_the_checks_prove() {
+        assert_eq!(delay_sample(25.0, Some(24.0)), 24.5);
+        assert_eq!(delay_sample(25.0, None), 12.5);
+        assert_eq!(delay_sample(1.0, Some(-3.0)), 0.0);
+    }
+
+    /// Plays `brackets` of checks against a fixed publish time, returning the first check it settles on.
+    fn settle(delays: &mut Vec<f64>, publish: f64, brackets: usize) -> f64 {
+        for _ in 0..brackets {
+            let mut at = first_poll_ms(delays);
+            let mut miss = None;
+            while (at as f64) < publish * 1000.0 {
+                miss = Some(at as f64 / 1000.0);
+                at += poll_gap_ms(delays, at);
+            }
+            add_delay(delays, delay_sample(at as f64 / 1000.0, miss));
         }
+        first_poll_ms(delays) as f64 / 1000.0
+    }
+
+    #[test]
+    fn estimate_adapts_within_an_hour_either_way() {
+        let mut delays = vec![40.0; 100];
+        let first = settle(&mut delays, 10.0, 12);
+        assert!((8.0..=10.0).contains(&first), "earlier: {first}");
         assert_eq!(delays.len(), MAX_DELAY_SAMPLES);
-        assert!((first_poll_seconds(&delays) as f64) < 15.0);
+        let first = settle(&mut delays, 40.0, 12);
+        assert!((37.0..=40.0).contains(&first), "later: {first}");
+    }
+
+    #[test]
+    fn one_odd_bracket_does_not_move_the_first_check() {
+        let mut delays = vec![25.0; 6];
+        add_delay(&mut delays, 5.0);
+        assert_eq!(first_poll_ms(&delays), 24_000);
+    }
+
+    #[test]
+    fn timing_view_lists_newest_first() {
+        let view = timing(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], 3);
+        assert_eq!(view.recent, [7.0, 6.0, 5.0, 4.0, 3.0, 2.0]);
+        assert_eq!((view.stored, view.checks), (7, 3));
+    }
+
+    #[test]
+    fn old_settings_files_get_the_new_defaults() {
+        let settings: Settings = serde_json::from_str(r#"{"buy_on":true}"#).unwrap();
+        assert!(settings.sound_on);
+        assert!(settings.tray == tray::Show::Buy);
     }
 
     fn interval(json: &str) -> Interval {

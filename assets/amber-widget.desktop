@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Amber
+Comment=Amber Electric prices and grid usage
+Exec=amber-widget
+Icon=amber-widget
+Terminal=false
+Categories=Utility;
+StartupWMClass=amber-widget
