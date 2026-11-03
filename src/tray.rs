@@ -2,6 +2,7 @@
 use std::sync::mpsc::Receiver;
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -9,6 +10,14 @@ pub struct Status {
     pub buy: f64,
     pub sell: Option<f64>,
     pub spike: bool,
+    pub show: Show,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub enum Show {
+    Buy,
+    Sell,
+    Logo,
 }
 
 const SIZE: usize = 32;
@@ -61,6 +70,11 @@ fn make_icon(text: &str, spike: bool) -> Option<Icon> {
     Icon::from_rgba(icon_rgba(text, spike), SIZE as u32, SIZE as u32).ok()
 }
 
+fn logo() -> Option<Icon> {
+    let icon = eframe::icon_data::from_png_bytes(crate::ICON_PNG).ok()?;
+    Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
+}
+
 fn build(ctx: egui::Context) -> Option<TrayIcon> {
     let open = MenuItem::new("Open Amber", true, None);
     let quit = MenuItem::new("Quit", true, None);
@@ -80,18 +94,30 @@ fn build(ctx: egui::Context) -> Option<TrayIcon> {
     }));
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_icon(make_icon("--", false)?)
+        .with_icon(logo()?)
         .with_tooltip("Amber")
         .build()
         .ok()
 }
 
 fn apply(tray: &TrayIcon, status: &Status) {
-    let text = icon_text(status.buy);
     let sell = status.sell.map_or(String::new(), |s| format!(", sell {s:.1}c"));
-    let _ = tray.set_icon(make_icon(&text, status.spike));
     let _ = tray.set_tooltip(Some(format!("Amber: buy {:.1}c{sell}", status.buy)));
-    tray.set_title(Some(format!("{text}c")));
+    let shown = match status.show {
+        Show::Buy => Some(status.buy),
+        Show::Sell => status.sell,
+        Show::Logo => None,
+    };
+    match shown.map(icon_text) {
+        Some(text) => {
+            let _ = tray.set_icon(make_icon(&text, status.spike));
+            tray.set_title(Some(format!("{text}c")));
+        }
+        None => {
+            let _ = tray.set_icon(logo());
+            tray.set_title(None::<String>);
+        }
+    }
 }
 
 /// Updates the tray from the worker. Linux needs its own GTK thread for this; elsewhere the tray
@@ -136,6 +162,11 @@ pub fn start(ctx: egui::Context, updates: Receiver<Status>) -> Pump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logo_decodes() {
+        assert!(logo().is_some());
+    }
 
     #[test]
     fn icon_text_fits_three_characters() {
