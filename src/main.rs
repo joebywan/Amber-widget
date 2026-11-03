@@ -252,6 +252,23 @@ fn forecast_snapshot(at: DateTime<Utc>, chart: &[Interval]) -> Option<String> {
     .ok()
 }
 
+/// One JSON line for the price Amber just published. `estimate` marks prices Amber may still revise.
+fn price_record(now: &[Interval]) -> Option<String> {
+    let buy = now.iter().find(|i| i.channel_type == "general")?;
+    let sell = now.iter().find(|i| i.channel_type == "feedIn");
+    serde_json::to_string(&serde_json::json!({
+        "start": buy.start_time,
+        "minutes": buy.duration,
+        "buy": buy.per_kwh,
+        "sell": sell.map(|i| earn_cents(i.per_kwh)),
+        "spot": buy.spot_per_kwh,
+        "renewables": buy.renewables,
+        "spike": buy.spike_status,
+        "estimate": buy.estimate,
+    }))
+    .ok()
+}
+
 /// Totals per "YYYY-MM", newest first.
 fn month_totals(days: &BTreeMap<String, Day>) -> Vec<(String, Day)> {
     let mut months: BTreeMap<String, Day> = BTreeMap::new();
@@ -588,15 +605,17 @@ fn save_token(token: &str) -> std::io::Result<()> {
     options.open(path)?.write_all(token.as_bytes())
 }
 
-fn forecasts_path() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("amber-widget").join("forecasts.jsonl")
-}
-
-fn append_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    writeln!(fs::OpenOptions::new().append(true).create(true).open(path)?, "{line}")
+/// Adds a line to a history file in the app's data folder. History is only for later analysis, so a
+/// failed write is ignored rather than getting in the way of prices.
+fn save_history(file: &str, line: &str) {
+    let path = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("amber-widget").join(file);
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        writeln!(fs::OpenOptions::new().append(true).create(true).open(&path)?, "{line}")
+    };
+    let _ = write();
 }
 
 /// For services outside Amber, so this must never carry the Amber token.
@@ -738,6 +757,12 @@ impl Worker {
             &[("next", "48".into()), ("previous", "12".into()), ("resolution", "30".into())],
         )?;
         self.save_snapshot(&chart);
+        // A forced refresh of a bracket already saved would only repeat it.
+        if self.shown_end != Some(end)
+            && let Some(line) = price_record(&now)
+        {
+            save_history("prices.jsonl", &line);
+        }
         let prices = build_prices(&now, &chart).map_err(FetchError::Other)?;
         if let Some((start, message)) = &prices.spike
             && self.alerted.insert(*start)
@@ -769,8 +794,7 @@ impl Worker {
             && let Some(line) = forecast_snapshot(now, chart)
         {
             self.snapshot_slot = slot;
-            // Only used for later analysis, so a failed write mustn't get in the way of prices.
-            let _ = append_line(&forecasts_path(), &line);
+            save_history("forecasts.jsonl", &line);
         }
     }
 
@@ -783,6 +807,10 @@ impl Worker {
         self.solar_postcode = postcode;
         let radiation = postcode.map(tomorrow_radiation).transpose();
         self.solar_at = radiation.is_ok().then(Instant::now);
+        if let (Some(postcode), Ok(Some(tomorrow))) = (postcode, &radiation) {
+            let record = serde_json::json!({ "at": Utc::now(), "postcode": format!("{postcode:04}"), "tomorrow_kwh_m2": tomorrow });
+            save_history("solar.jsonl", &record.to_string());
+        }
         (self.send)(Update::Solar(radiation.unwrap_or(None)));
     }
 
@@ -1595,6 +1623,22 @@ mod tests {
         assert_eq!(line["buy"], serde_json::json!([3.46]));
         assert_eq!(line["sell"], serde_json::json!([-3.46]));
         assert_eq!(forecast_snapshot(at, &[actual]), None);
+    }
+
+    #[test]
+    fn price_record_keeps_both_channels() {
+        let time = r#""type":"CurrentInterval","estimate":true,"startTime":"2026-11-02T09:00:00Z","endTime":"2026-11-02T09:05:00Z""#;
+        let buy = interval(time);
+        let mut sell = interval(time);
+        sell.channel_type = "feedIn".into();
+        sell.per_kwh = -4.5;
+        let line: serde_json::Value = serde_json::from_str(&price_record(&[buy.clone(), sell]).unwrap()).unwrap();
+        assert_eq!(line["start"], "2026-11-02T09:00:00Z");
+        assert_eq!((line["buy"].as_f64(), line["sell"].as_f64()), (Some(10.0), Some(4.5)));
+        assert_eq!(line["estimate"], true);
+        let alone: serde_json::Value = serde_json::from_str(&price_record(&[buy]).unwrap()).unwrap();
+        assert!(alone["sell"].is_null());
+        assert_eq!(price_record(&[]), None);
     }
 
     #[test]
