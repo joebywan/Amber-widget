@@ -26,6 +26,8 @@ const RECENT_DELAY_SAMPLES: usize = 6;
 const MAX_DELAY_SAMPLES: usize = 100;
 const ERROR_RETRY_SECONDS: i64 = 60;
 const USAGE_PERIOD: Duration = Duration::from_secs(3600);
+const SOLAR_PERIOD: Duration = Duration::from_secs(3 * 3600);
+const SNAPSHOT_SECONDS: i64 = 1800;
 const BUY_COLOR: Color32 = Color32::from_rgb(0x2a, 0x78, 0xc9);
 const SELL_COLOR: Color32 = Color32::from_rgb(0xc9, 0x63, 0x1a);
 
@@ -77,6 +79,27 @@ struct UsageRow {
     channel_type: String,
     kwh: f64,
     cost: f64,
+}
+
+#[derive(Deserialize)]
+struct PostcodeLookup {
+    places: Vec<Place>,
+}
+
+#[derive(Deserialize)]
+struct Place {
+    latitude: String,
+    longitude: String,
+}
+
+#[derive(Deserialize)]
+struct WeatherForecast {
+    daily: WeatherDaily,
+}
+
+#[derive(Deserialize)]
+struct WeatherDaily {
+    shortwave_radiation_sum: Vec<f64>,
 }
 
 // --- Pure logic ---
@@ -193,6 +216,40 @@ fn export_line(current: Option<f64>, rows: &[Interval]) -> String {
         Some((t, amount)) => format!("{:.1}c {} from {}", amount.abs(), noun(amount), clock(t)),
         None => String::new(),
     }
+}
+
+/// Tomorrow's solar outlook. `radiation` is kWh/m² for the day; `system_kw` is 0 when not set.
+fn solar_line(radiation: f64, system_kw: f64) -> String {
+    // ponytail: fixed thresholds run low in winter, compare against the season's normal if labels misfire.
+    let rating = if radiation < 3.0 { "poor" } else if radiation < 5.0 { "fair" } else { "good" };
+    let amount = if system_kw > 0.0 {
+        // 1 kWh/m² is about 1 kWh per kW of panels before real-world losses.
+        format!("about {:.0} kWh from your {system_kw:.1} kW system", radiation * system_kw * 0.8)
+    } else {
+        format!("{radiation:.1} kWh/m²")
+    };
+    let hint = if radiation < 3.0 { " Consider keeping battery charge for the evening." } else { "" };
+    format!("Tomorrow: {rating} solar, {amount}.{hint}")
+}
+
+fn valid_postcode(text: &str) -> Option<u16> {
+    if text.len() == 4 && text.bytes().all(|b| b.is_ascii_digit()) { text.parse().ok() } else { None }
+}
+
+/// One JSON line: when it was taken, the first forecast interval, then buy and sell c/kWh per interval.
+fn forecast_snapshot(at: DateTime<Utc>, chart: &[Interval]) -> Option<String> {
+    let values = |name: &str, convert: fn(f64) -> f64| -> Vec<f64> {
+        let rows = chart.iter().filter(|i| i.channel_type == name && i.kind == "ForecastInterval");
+        rows.map(|i| (convert(forecast_cents(i)) * 100.0).round() / 100.0).collect()
+    };
+    let first = chart.iter().find(|i| i.kind == "ForecastInterval")?.start_time;
+    serde_json::to_string(&serde_json::json!({
+        "at": at,
+        "first": first,
+        "buy": values("general", |v| v),
+        "sell": values("feedIn", earn_cents),
+    }))
+    .ok()
 }
 
 /// Totals per "YYYY-MM", newest first.
@@ -332,6 +389,8 @@ struct Settings {
     sound_on: bool,
     sound: Sound,
     tray: tray::Show,
+    postcode: Option<u16>,
+    system_kw: f64,
 }
 
 impl Default for Settings {
@@ -348,6 +407,8 @@ impl Default for Settings {
             sound_on: true,
             sound: Sound::Message,
             tray: tray::Show::Buy,
+            postcode: None,
+            system_kw: 0.0,
         }
     }
 }
@@ -527,6 +588,48 @@ fn save_token(token: &str) -> std::io::Result<()> {
     options.open(path)?.write_all(token.as_bytes())
 }
 
+fn forecasts_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("amber-widget").join("forecasts.jsonl")
+}
+
+fn append_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    writeln!(fs::OpenOptions::new().append(true).create(true).open(path)?, "{line}")
+}
+
+/// For services outside Amber, so this must never carry the Amber token.
+fn get_public<T: serde::de::DeserializeOwned>(url: String, params: &[(&str, String)]) -> Result<T, String> {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
+    let mut request = agent.get(url);
+    for (name, value) in params {
+        request = request.query(*name, value);
+    }
+    request.call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())
+}
+
+/// Tomorrow's solar radiation in kWh/m² at the postcode.
+fn tomorrow_radiation(postcode: u16) -> Result<f64, String> {
+    let base = std::env::var("AMBER_POSTCODE_BASE").unwrap_or_else(|_| "https://api.zippopotam.us".into());
+    let lookup: PostcodeLookup = get_public(format!("{base}/AU/{postcode:04}"), &[])?;
+    let place = lookup.places.first().ok_or("Unknown postcode")?;
+    let base = std::env::var("AMBER_WEATHER_BASE").unwrap_or_else(|_| "https://api.open-meteo.com".into());
+    let forecast: WeatherForecast = get_public(
+        format!("{base}/v1/forecast"),
+        &[
+            ("latitude", place.latitude.clone()),
+            ("longitude", place.longitude.clone()),
+            ("daily", "shortwave_radiation_sum".into()),
+            ("forecast_days", "2".into()),
+            ("timezone", "auto".into()),
+        ],
+    )?;
+    let megajoules = forecast.daily.shortwave_radiation_sum.get(1).ok_or("No forecast for tomorrow")?;
+    Ok(megajoules / 3.6)
+}
+
 enum FetchError {
     Unauthorized,
     Other(String),
@@ -557,6 +660,7 @@ enum Update {
     NeedToken(&'static str),
     Waiting,
     Timing(Timing),
+    Solar(Option<f64>),
 }
 
 /// What the Settings tab shows about when the worker checks for a new price. All in seconds into a bracket.
@@ -581,6 +685,9 @@ fn timing(delays: &[f64], checks: u32) -> Timing {
 struct Worker {
     site: Option<String>,
     usage_at: Option<Instant>,
+    solar_at: Option<Instant>,
+    solar_postcode: Option<u16>,
+    snapshot_slot: i64,
     alerted: HashSet<DateTime<Utc>>,
     settings: Arc<Mutex<Settings>>,
     buy_above: bool,
@@ -630,6 +737,7 @@ impl Worker {
             &path,
             &[("next", "48".into()), ("previous", "12".into()), ("resolution", "30".into())],
         )?;
+        self.save_snapshot(&chart);
         let prices = build_prices(&now, &chart).map_err(FetchError::Other)?;
         if let Some((start, message)) = &prices.spike
             && self.alerted.insert(*start)
@@ -644,12 +752,38 @@ impl Worker {
         self.checks_this_bracket = 0;
         self.last_miss = None;
 
+        self.refresh_solar();
         if self.usage_at.is_none_or(|at| at.elapsed() >= USAGE_PERIOD) {
             self.refresh_usage(&site)?;
             self.usage_at = Some(Instant::now());
             (self.send)(Update::Usage(self.usage_days.clone()));
         }
         Ok(latest)
+    }
+
+    /// Forecasts can't be fetched after the fact, so keep one every half hour to score them against prices later.
+    fn save_snapshot(&mut self, chart: &[Interval]) {
+        let now = Utc::now();
+        let slot = now.timestamp() / SNAPSHOT_SECONDS;
+        if slot != self.snapshot_slot
+            && let Some(line) = forecast_snapshot(now, chart)
+        {
+            self.snapshot_slot = slot;
+            // Only used for later analysis, so a failed write mustn't get in the way of prices.
+            let _ = append_line(&forecasts_path(), &line);
+        }
+    }
+
+    /// Failures just hide the outlook and retry at the next bracket; prices carry on regardless.
+    fn refresh_solar(&mut self) {
+        let postcode = self.settings.lock().unwrap().postcode;
+        if postcode == self.solar_postcode && self.solar_at.is_some_and(|at| at.elapsed() < SOLAR_PERIOD) {
+            return;
+        }
+        self.solar_postcode = postcode;
+        let radiation = postcode.map(tomorrow_radiation).transpose();
+        self.solar_at = radiation.is_ok().then(Instant::now);
+        (self.send)(Update::Solar(radiation.unwrap_or(None)));
     }
 
     /// The first load goes back to the start of last month for the totals. After that only the last
@@ -799,6 +933,8 @@ struct App {
     settings: Arc<Mutex<Settings>>,
     timing: Option<Timing>,
     tab: Tab,
+    solar: Option<f64>,
+    postcode_input: String,
     tray_updates: Sender<tray::Status>,
     tray: tray::Pump,
 }
@@ -808,11 +944,15 @@ impl App {
         let (update_tx, updates) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel();
         let settings = Arc::new(Mutex::new(read_settings()));
+        let postcode_input = settings.lock().unwrap().postcode.map_or(String::new(), |p| format!("{p:04}"));
         let (tray_tx, tray_rx) = mpsc::channel();
         let pump = tray::start(ctx.clone(), tray_rx);
         let worker = Worker {
             site: None,
             usage_at: None,
+            solar_at: None,
+            solar_postcode: None,
+            snapshot_slot: 0,
             alerted: HashSet::new(),
             settings: settings.clone(),
             buy_above: false,
@@ -844,6 +984,8 @@ impl App {
             settings,
             timing: None,
             tab: Tab::Settings,
+            solar: None,
+            postcode_input,
             tray_updates: tray_tx,
             tray: pump,
         }
@@ -857,6 +999,7 @@ impl App {
             }
             Update::Usage(days) => self.usage = Some(days),
             Update::Timing(timing) => self.timing = Some(timing),
+            Update::Solar(radiation) => self.solar = radiation,
             Update::Waiting => self.status = "Waiting for Amber's latest 5-minute price…".into(),
             Update::NeedToken(problem) => {
                 self.token_prompt = Some(problem);
@@ -918,6 +1061,9 @@ impl App {
         ui.add_space(6.0);
         if let Some(p) = prices {
             ui.label(RichText::new(p.advice).strong());
+            if let Some(radiation) = self.solar {
+                ui.label(solar_line(radiation, self.settings.lock().unwrap().system_kw));
+            }
             if let Some((_, message)) = &p.spike {
                 ui.label(RichText::new(message).strong());
             }
@@ -979,6 +1125,23 @@ impl App {
             }
         }
         ui.add_space(6.0);
+        ui.label(RichText::new("Solar outlook").strong());
+        ui.horizontal(|ui| {
+            ui.label("Postcode");
+            ui.add(egui::TextEdit::singleline(&mut self.postcode_input).char_limit(4).desired_width(48.0));
+            ui.label("System size");
+            ui.add(egui::DragValue::new(&mut edited.system_kw).speed(0.1).range(0.0..=100.0).max_decimals(1).suffix(" kW"));
+        });
+        let entered = self.postcode_input.trim();
+        if entered.is_empty() {
+            edited.postcode = None;
+        } else if let Some(postcode) = valid_postcode(entered) {
+            edited.postcode = Some(postcode);
+        } else {
+            ui.weak("Enter a 4-digit postcode");
+        }
+        ui.weak("Your postcode goes to zippopotam.us, and its coordinates to Open-Meteo.com, which supplies the weather data.");
+        ui.add_space(6.0);
         ui.label(RichText::new("Tray icon shows").strong());
         ui.horizontal(|ui| {
             ui.radio_value(&mut edited.tray, tray::Show::Buy, "Buy price");
@@ -992,6 +1155,9 @@ impl App {
             }
             if let Some(p) = &self.prices {
                 let _ = self.tray_updates.send(tray_status(p, edited.tray));
+            }
+            if edited.postcode != saved.postcode {
+                let _ = self.wake.send(());
             }
         }
         ui.add_space(6.0);
@@ -1402,10 +1568,41 @@ mod tests {
     }
 
     #[test]
+    fn solar_line_rates_the_day_and_uses_system_size() {
+        assert_eq!(solar_line(7.0, 0.0), "Tomorrow: good solar, 7.0 kWh/m².");
+        assert_eq!(solar_line(4.0, 5.0), "Tomorrow: fair solar, about 16 kWh from your 5.0 kW system.");
+        assert!(solar_line(2.0, 0.0).contains("poor") && solar_line(2.0, 0.0).contains("keeping battery"));
+    }
+
+    #[test]
+    fn postcodes_must_be_four_digits() {
+        assert_eq!(valid_postcode("2000"), Some(2000));
+        assert_eq!(valid_postcode("0800"), Some(800));
+        assert_eq!(valid_postcode("200"), None);
+        assert_eq!(valid_postcode("20a0"), None);
+    }
+
+    #[test]
+    fn snapshot_keeps_only_forecasts_in_cents() {
+        let time = |t: &str| format!(r#""startTime":"2026-11-02T{t}:00:00Z","endTime":"2026-11-02T{t}:30:00Z""#);
+        let actual = interval(&format!(r#""type":"ActualInterval",{}"#, time("08")));
+        let ahead = interval(&format!(r#""type":"ForecastInterval",{},"advancedPrice":{{"low":1,"predicted":3.456,"high":9}}"#, time("09")));
+        let mut sell = ahead.clone();
+        sell.channel_type = "feedIn".into();
+        let at = "2026-11-02T08:30:00Z".parse().unwrap();
+        let line: serde_json::Value = serde_json::from_str(&forecast_snapshot(at, &[actual.clone(), ahead, sell]).unwrap()).unwrap();
+        assert_eq!(line["first"], "2026-11-02T09:00:00Z");
+        assert_eq!(line["buy"], serde_json::json!([3.46]));
+        assert_eq!(line["sell"], serde_json::json!([-3.46]));
+        assert_eq!(forecast_snapshot(at, &[actual]), None);
+    }
+
+    #[test]
     fn old_settings_files_get_the_new_defaults() {
         let settings: Settings = serde_json::from_str(r#"{"buy_on":true}"#).unwrap();
         assert!(settings.sound_on);
         assert!(settings.tray == tray::Show::Buy);
+        assert_eq!(settings.postcode, None);
     }
 
     fn interval(json: &str) -> Interval {
